@@ -9,6 +9,18 @@ import joblib
 import os
 from datetime import datetime, timedelta
 import random
+import warnings
+warnings.filterwarnings('ignore')
+
+# Import time-series forecasting modules
+try:
+    from sarimax_forecaster import AQISARIMAXForecaster, generate_future_exogenous_data
+    from data_preprocessing import AQIDataPreprocessor
+    from model_training import load_trained_model, predict_aqi_for_date
+    TIME_SERIES_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: Time-series modules not available: {e}")
+    TIME_SERIES_AVAILABLE = False
 
 app = FastAPI(title="Air Quality Prediction API", version="1.0")
 
@@ -26,6 +38,10 @@ DATA_PATH = "aqidaily_fiveyears.csv"
 MODEL_PATH = "enhanced_aqi_model.pkl"
 SCALER_PATH = "enhanced_scaler.pkl"
 FEATURE_NAMES_PATH = "feature_names.pkl"
+
+# Time-series model paths
+SARIMAX_MODEL_PATH = "aqi_sarimax_model.pkl"
+SARIMAX_METADATA_PATH = "model_metadata.json"
 
 # Define input schema
 class AQIInput(BaseModel):
@@ -83,11 +99,65 @@ else:
     else:
         raise FileNotFoundError("No model found. Please train a model first.")
 
+# Load time-series forecasting model
+sarimax_forecaster = None
+sarimax_metadata = None
+training_data = None
+
+if TIME_SERIES_AVAILABLE and os.path.exists(SARIMAX_MODEL_PATH):
+    try:
+        sarimax_forecaster, sarimax_metadata = load_trained_model()
+        
+        # Load training data for historical lookups
+        preprocessor = AQIDataPreprocessor(DATA_PATH)
+        processed_data = preprocessor.preprocess()
+        training_data = preprocessor.get_training_data(end_date='2024-12-31')
+        
+        print("✅ SARIMAX time-series model loaded successfully!")
+        print(f"   Model type: {sarimax_metadata['model_type']}")
+        print(f"   Training date range: {sarimax_metadata['training_date_range'][0]} to {sarimax_metadata['training_date_range'][1]}")
+        print(f"   Validation RMSE: {sarimax_metadata['validation_metrics']['rmse']:.2f}")
+        
+    except Exception as e:
+        print(f"⚠️  Failed to load SARIMAX model: {e}")
+        sarimax_forecaster = None
+        sarimax_metadata = None
+        training_data = None
+else:
+    print("⚠️  SARIMAX model not available. Time-series forecasting disabled.")
+
 
 # ---------- API Endpoints ----------
 @app.get("/")
 def root():
     return {"message": "Air Quality Prediction API is running."}
+
+@app.get("/model-status")
+def get_model_status():
+    """Get information about loaded models"""
+    status = {
+        "random_forest_model": {
+            "loaded": os.path.exists(MODEL_PATH),
+            "type": "Random Forest Regressor"
+        },
+        "sarimax_model": {
+            "loaded": sarimax_forecaster is not None,
+            "available": TIME_SERIES_AVAILABLE,
+            "type": "SARIMAX Time-Series"
+        }
+    }
+    
+    if sarimax_forecaster is not None and sarimax_metadata is not None:
+        status["sarimax_model"].update({
+            "order": sarimax_metadata['order'],
+            "seasonal_order": sarimax_metadata['seasonal_order'],
+            "training_date_range": sarimax_metadata['training_date_range'],
+            "validation_rmse": sarimax_metadata['validation_metrics']['rmse'],
+            "aic": sarimax_metadata['aic'],
+            "bic": sarimax_metadata['bic']
+        })
+    
+    return status
 
 
 @app.post("/predict")
@@ -141,64 +211,141 @@ def predict_aqi(input_data: AQIInput):
 
 @app.post("/predict-by-date")
 def predict_aqi_by_date(input_data: DateInput):
-    """Predict AQI based on historical data patterns for a specific date"""
+    """Predict AQI for a specific date using time-series forecasting or historical data"""
     try:
         # Parse the input date
         target_date = datetime.strptime(input_data.date, "%Y-%m-%d")
         
-        # Generate realistic environmental conditions based on date patterns
-        environmental_data = generate_seasonal_data(target_date)
-        
-        # Create AQIInput object for prediction
-        aqi_input = AQIInput(**environmental_data)
-        
-        # Use enhanced model if available
-        if feature_names is not None:
-            # Create features for date-based prediction
-            features = create_date_prediction_features(target_date, environmental_data)
-            data = np.array([features])
+        # Check if SARIMAX model is available for time-series forecasting
+        if sarimax_forecaster is not None and training_data is not None:
+            # Use time-series forecasting
+            historical_start = training_data.index.min()
+            historical_end = training_data.index.max()
             
-            # Apply scaling if scaler is available
-            if scaler is not None:
-                data = scaler.transform(data)
+            if historical_start <= target_date <= historical_end:
+                # Return actual historical value
+                actual_aqi = training_data.loc[target_date, 'aqi']
+                
+                # Generate environmental conditions for explanation
+                environmental_data = generate_seasonal_data(target_date)
+                
+                # AQI category logic
+                if actual_aqi <= 50:
+                    category = "Good"
+                elif actual_aqi <= 100:
+                    category = "Moderate"
+                elif actual_aqi <= 200:
+                    category = "Poor"
+                elif actual_aqi <= 300:
+                    category = "Very Poor"
+                else:
+                    category = "Hazardous"
+                
+                explanation = f"Historical AQI data for {target_date.strftime('%B %d, %Y')}. " + generate_date_explanation(target_date, environmental_data, actual_aqi, category)
+                
+                return {
+                    "predicted_AQI": round(float(actual_aqi), 2),
+                    "category": category,
+                    "explanation": explanation,
+                    "estimated_conditions": environmental_data,
+                    "date": input_data.date,
+                    "source": "historical_data",
+                    "is_historical": True
+                }
+            else:
+                # Generate forecast for future date
+                exog_future = generate_future_exogenous_data(target_date, training_data)
+                prediction = sarimax_forecaster.predict_single_date(target_date, exog_future)
+                
+                # Convert exogenous variables to environmental data format for explanation
+                environmental_data = {
+                    "Temperature": round(20 + 10 * np.sin(2 * np.pi * target_date.timetuple().tm_yday / 365), 1),
+                    "Humidity": round(exog_future.get('ozone', 40) * 1.5, 1),  # Rough conversion
+                    "WindSpeed": round(10 + np.random.uniform(-3, 3), 1),
+                    "NO2": round(exog_future.get('no2', 20), 1),
+                    "CO": round(exog_future.get('co', 3), 1),
+                    "PM25": round(exog_future.get('pm25', 25), 1),
+                    "PM10": round(exog_future.get('pm10', 30), 1)
+                }
+                
+                # AQI category logic
+                if prediction <= 50:
+                    category = "Good"
+                elif prediction <= 100:
+                    category = "Moderate"
+                elif prediction <= 200:
+                    category = "Poor"
+                elif prediction <= 300:
+                    category = "Very Poor"
+                else:
+                    category = "Hazardous"
+                
+                explanation = f"Time-series forecast for {target_date.strftime('%B %d, %Y')}. " + generate_date_explanation(target_date, environmental_data, prediction, category)
+                
+                return {
+                    "predicted_AQI": round(float(prediction), 2),
+                    "category": category,
+                    "explanation": explanation,
+                    "estimated_conditions": environmental_data,
+                    "date": input_data.date,
+                    "source": "sarimax_forecast",
+                    "is_historical": False,
+                    "model_info": {
+                        "type": sarimax_metadata['model_type'],
+                        "order": sarimax_metadata['order'],
+                        "seasonal_order": sarimax_metadata['seasonal_order'],
+                        "validation_rmse": sarimax_metadata['validation_metrics']['rmse']
+                    }
+                }
         else:
-            # Fallback to original format
-            data = np.array([
-                [
-                    aqi_input.Temperature,
-                    aqi_input.Humidity,
-                    aqi_input.WindSpeed,
-                    aqi_input.NO2,
-                    aqi_input.CO,
-                    aqi_input.PM25,
-                    aqi_input.PM10
-                ]
-            ])
-        
-        prediction = model.predict(data)[0]
-        
-        # AQI category logic
-        if prediction <= 50:
-            category = "Good"
-        elif prediction <= 100:
-            category = "Moderate"
-        elif prediction <= 200:
-            category = "Poor"
-        elif prediction <= 300:
-            category = "Very Poor"
-        else:
-            category = "Hazardous"
-        
-        # Generate explanation for date-based prediction
-        explanation = generate_date_explanation(target_date, environmental_data, prediction, category)
-        
-        return {
-            "predicted_AQI": round(float(prediction), 2),
-            "category": category,
-            "explanation": explanation,
-            "estimated_conditions": environmental_data,
-            "date": input_data.date
-        }
+            # Fallback to original method if SARIMAX not available
+            environmental_data = generate_seasonal_data(target_date)
+            aqi_input = AQIInput(**environmental_data)
+            
+            # Use enhanced model if available
+            if feature_names is not None:
+                features = create_date_prediction_features(target_date, environmental_data)
+                data = np.array([features])
+                if scaler is not None:
+                    data = scaler.transform(data)
+            else:
+                data = np.array([
+                    [
+                        aqi_input.Temperature,
+                        aqi_input.Humidity,
+                        aqi_input.WindSpeed,
+                        aqi_input.NO2,
+                        aqi_input.CO,
+                        aqi_input.PM25,
+                        aqi_input.PM10
+                    ]
+                ])
+            
+            prediction = model.predict(data)[0]
+            
+            # AQI category logic
+            if prediction <= 50:
+                category = "Good"
+            elif prediction <= 100:
+                category = "Moderate"
+            elif prediction <= 200:
+                category = "Poor"
+            elif prediction <= 300:
+                category = "Very Poor"
+            else:
+                category = "Hazardous"
+            
+            explanation = generate_date_explanation(target_date, environmental_data, prediction, category)
+            
+            return {
+                "predicted_AQI": round(float(prediction), 2),
+                "category": category,
+                "explanation": explanation,
+                "estimated_conditions": environmental_data,
+                "date": input_data.date,
+                "source": "fallback_model",
+                "is_historical": False
+            }
         
     except ValueError as e:
         return {"error": f"Invalid date format. Please use YYYY-MM-DD format. Error: {str(e)}"}
